@@ -11,7 +11,7 @@ This project is a proof of concept, demonstrating the feasibility of building an
 
 ## Screenshots
 
-![](assets\2026-06-15-16-51-49.png)Pressing the `a` key commits the character `a`. The spacebar, backspace, and enter keys all function correctly.
+![](assets/2026-06-15-16-51-49.png)Pressing the `a` key commits the character `a`. The spacebar, backspace, and enter keys all function correctly.
 
 ## Try It on Your Own Device
 
@@ -30,7 +30,7 @@ This project is a proof of concept, demonstrating the feasibility of building an
    dotnet run
    ```
 2. Enable the input method in your phone’s input method settings
-   ![](assets\2026-06-15-16-50-54.png)
+   ![](assets/2026-06-15-16-50-54.png)
 3. Select the input method
 4. Focus on an input field — the IME UI will appear
 

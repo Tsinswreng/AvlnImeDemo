@@ -15,7 +15,7 @@
 ]
 
 #H[Screenshots][
-	#image("assets\2026-06-15-16-51-49.png")
+	#image("assets/2026-06-15-16-51-49.png")
 	Pressing the `a` key commits the character `a`. The spacebar, backspace, and enter keys all function correctly.
 ]
 
@@ -38,7 +38,7 @@
 				```
 			]
 		+ #[Enable the input method in your phone's input method settings
-				#image("assets\2026-06-15-16-50-54.png")
+				#image("assets/2026-06-15-16-50-54.png")
 			]
 		+ #[Select the input method]
 		+ #[Focus on an input field — the IME UI will appear]
