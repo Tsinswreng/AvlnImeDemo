@@ -1,6 +1,7 @@
 using Android.App;
 using Android.Content;
 using Android.InputMethodServices;
+using Android.Views;
 using Android.Views.InputMethods;
 using Avalonia.Android;
 using AvlnImeDemo.Ime;
@@ -18,12 +19,33 @@ public sealed class ImeInputMethodService : InputMethodService
 {
     private AvaloniaView? _view;
 
+    private int GetHalfScreenHeight()
+    {
+        var screenHeight = Resources?.DisplayMetrics?.HeightPixels ?? 0;
+        return screenHeight > 0 ? screenHeight / 2 : ViewGroup.LayoutParams.WrapContent;
+    }
+
+    public override bool OnEvaluateFullscreenMode()
+    {
+        return false;
+    }
+
+    public override void OnConfigureWindow(Window? win, bool isFullscreen, bool isCandidatesOnly)
+    {
+        base.OnConfigureWindow(win, false, isCandidatesOnly);
+        win?.SetLayout(ViewGroup.LayoutParams.MatchParent, GetHalfScreenHeight());
+    }
+
     public override global::Android.Views.View OnCreateInputView()
     {
         _view ??= new AvaloniaView(this)
         {
             Content = new ImeKeyboardView()
         };
+
+        _view.LayoutParameters = new ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent,
+            GetHalfScreenHeight());
 
         return _view;
     }
