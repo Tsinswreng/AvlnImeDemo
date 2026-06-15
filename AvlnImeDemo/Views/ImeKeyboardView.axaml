@@ -1,0 +1,27 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:AvlnImeDemo.ViewModels"
+             x:Class="AvlnImeDemo.Views.ImeKeyboardView"
+             x:DataType="vm:ImeKeyboardViewModel"
+             mc:Ignorable="d"
+             d:DesignWidth="420"
+             d:DesignHeight="260">
+    <Border Background="#20242B" Padding="12">
+        <StackPanel Spacing="12">
+            <TextBlock Text="Avalonia IME PoC"
+                       FontSize="18"
+                       FontWeight="SemiBold"
+                       Foreground="White" />
+            <TextBlock Text="Press buttons to commit text into the focused editor."
+                       Foreground="#C8D0DA" />
+            <UniformGrid Columns="4" Rows="1">
+                <Button Margin="4" Padding="18,14" Content="A" Click="TypeA_OnClick" />
+                <Button Margin="4" Padding="18,14" Content="Space" Click="Space_OnClick" />
+                <Button Margin="4" Padding="18,14" Content="Backspace" Click="Backspace_OnClick" />
+                <Button Margin="4" Padding="18,14" Content="Enter" Click="Enter_OnClick" />
+            </UniformGrid>
+        </StackPanel>
+    </Border>
+</UserControl>

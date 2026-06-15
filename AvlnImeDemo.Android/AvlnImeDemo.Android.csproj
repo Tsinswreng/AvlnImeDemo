@@ -25,4 +25,8 @@
   <ItemGroup>
     <ProjectReference Include="..\AvlnImeDemo\AvlnImeDemo.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <AndroidResource Include="Resources\xml\ime_method.xml" />
+  </ItemGroup>
 </Project>
