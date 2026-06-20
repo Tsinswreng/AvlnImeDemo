@@ -18,6 +18,7 @@ namespace AvlnImeDemo.Android;
 public sealed class ImeInputMethodService : InputMethodService
 {
     private AvaloniaView? _view;
+    private bool _shouldRecreateView;
 
     private int GetHalfScreenHeight()
     {
@@ -38,21 +39,35 @@ public sealed class ImeInputMethodService : InputMethodService
 
     public override global::Android.Views.View OnCreateInputView()
     {
-        _view ??= new AvaloniaView(this)
+        if (_view is not null && !_shouldRecreateView)
+        {
+            return _view;
+        }
+
+        _view = new AvaloniaView(this)
         {
             Content = new ImeKeyboardView()
         };
-
         _view.LayoutParameters = new ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MatchParent,
             GetHalfScreenHeight());
-
+        _shouldRecreateView = false;
         return _view;
+    }
+
+    public override void OnCreate()
+    {
+        SetTheme(Resource.Style.MyTheme_Ime);
+        base.OnCreate();
     }
 
     public override void OnStartInputView(EditorInfo? info, bool restarting)
     {
         base.OnStartInputView(info, restarting);
+        if (_shouldRecreateView)
+        {
+            SetInputView(OnCreateInputView());
+        }
         ImeServiceBridge.Instance.CommitTextRequested += OnCommitTextRequested;
         ImeServiceBridge.Instance.DeleteSurroundingTextRequested += OnDeleteSurroundingTextRequested;
         ImeServiceBridge.Instance.KeyEventRequested += OnKeyEventRequested;
@@ -63,6 +78,7 @@ public sealed class ImeInputMethodService : InputMethodService
         ImeServiceBridge.Instance.CommitTextRequested -= OnCommitTextRequested;
         ImeServiceBridge.Instance.DeleteSurroundingTextRequested -= OnDeleteSurroundingTextRequested;
         ImeServiceBridge.Instance.KeyEventRequested -= OnKeyEventRequested;
+        _shouldRecreateView = true;
         base.OnFinishInputView(finishingInput);
     }
 
