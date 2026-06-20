@@ -16,11 +16,12 @@
                        Foreground="White" />
             <TextBlock Text="Press buttons to commit text into the focused editor."
                        Foreground="#C8D0DA" />
-            <UniformGrid Columns="4" Rows="1">
+            <UniformGrid Columns="5" Rows="1">
                 <Button Margin="4" Padding="18,14" Content="A" Click="TypeA_OnClick" />
                 <Button Margin="4" Padding="18,14" Content="Space" Click="Space_OnClick" />
                 <Button Margin="4" Padding="18,14" Content="Backspace" Click="Backspace_OnClick" />
                 <Button Margin="4" Padding="18,14" Content="Enter" Click="Enter_OnClick" />
+                <Button Margin="4" Padding="18,14" Content="Hide" Click="Hide_OnClick" />
             </UniformGrid>
         </StackPanel>
     </Border>

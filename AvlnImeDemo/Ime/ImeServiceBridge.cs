@@ -7,6 +7,7 @@ public interface IImeServiceBridge
     event Action<string>? CommitTextRequested;
     event Action<int>? DeleteSurroundingTextRequested;
     event Action<string>? KeyEventRequested;
+    event Action? HideKeyboardRequested;
 }
 
 public sealed class ImeServiceBridge : IImeServiceBridge
@@ -16,6 +17,7 @@ public sealed class ImeServiceBridge : IImeServiceBridge
     public event Action<string>? CommitTextRequested;
     public event Action<int>? DeleteSurroundingTextRequested;
     public event Action<string>? KeyEventRequested;
+    public event Action? HideKeyboardRequested;
 
     private ImeServiceBridge()
     {
@@ -34,5 +36,10 @@ public sealed class ImeServiceBridge : IImeServiceBridge
     public void SendKeyEvent(string keyName)
     {
         KeyEventRequested?.Invoke(keyName);
+    }
+
+    public void HideKeyboard()
+    {
+        HideKeyboardRequested?.Invoke();
     }
 }

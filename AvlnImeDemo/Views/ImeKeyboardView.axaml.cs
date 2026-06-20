@@ -33,4 +33,9 @@ public partial class ImeKeyboardView : UserControl
     {
         Vm.Enter();
     }
+
+    private void Hide_OnClick(object? sender, RoutedEventArgs e)
+    {
+        Vm.HideKeyboard();
+    }
 }

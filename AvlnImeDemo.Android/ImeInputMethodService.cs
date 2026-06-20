@@ -71,6 +71,7 @@ public sealed class ImeInputMethodService : InputMethodService
         ImeServiceBridge.Instance.CommitTextRequested += OnCommitTextRequested;
         ImeServiceBridge.Instance.DeleteSurroundingTextRequested += OnDeleteSurroundingTextRequested;
         ImeServiceBridge.Instance.KeyEventRequested += OnKeyEventRequested;
+        ImeServiceBridge.Instance.HideKeyboardRequested += OnHideKeyboardRequested;
     }
 
     public override void OnFinishInputView(bool finishingInput)
@@ -78,6 +79,7 @@ public sealed class ImeInputMethodService : InputMethodService
         ImeServiceBridge.Instance.CommitTextRequested -= OnCommitTextRequested;
         ImeServiceBridge.Instance.DeleteSurroundingTextRequested -= OnDeleteSurroundingTextRequested;
         ImeServiceBridge.Instance.KeyEventRequested -= OnKeyEventRequested;
+        ImeServiceBridge.Instance.HideKeyboardRequested -= OnHideKeyboardRequested;
         _shouldRecreateView = true;
         base.OnFinishInputView(finishingInput);
     }
@@ -109,5 +111,10 @@ public sealed class ImeInputMethodService : InputMethodService
         var up = new global::Android.Views.KeyEvent(global::Android.Views.KeyEventActions.Up, keyCode);
         CurrentInputConnection?.SendKeyEvent(down);
         CurrentInputConnection?.SendKeyEvent(up);
+    }
+
+    private void OnHideKeyboardRequested()
+    {
+        RequestHideSelf(0);
     }
 }

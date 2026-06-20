@@ -25,4 +25,9 @@ public sealed class ImeKeyboardViewModel : ViewModelBase
     {
         _ime.SendKeyEvent("Enter");
     }
+
+    public void HideKeyboard()
+    {
+        _ime.HideKeyboard();
+    }
 }
