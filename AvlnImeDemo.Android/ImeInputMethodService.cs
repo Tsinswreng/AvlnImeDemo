@@ -17,7 +17,10 @@ namespace AvlnImeDemo.Android;
 [MetaData("android.view.im", Resource = "@xml/ime_method")]
 public sealed class ImeInputMethodService : InputMethodService {
 	public AvaloniaView? ImeView { get; set; }
-	public bool ShouldRecreateImeView { get; set; }
+	public bool ShouldRecreateImeView {
+		get=>false;
+		set{}
+	}
 
 	private int GetHalfScreenHeight() {
 		var screenHeight = Resources?.DisplayMetrics?.HeightPixels ?? 0;
