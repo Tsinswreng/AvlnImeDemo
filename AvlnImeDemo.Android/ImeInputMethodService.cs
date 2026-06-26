@@ -22,6 +22,12 @@ public sealed class ImeInputMethodService : InputMethodService {
 	public AvaloniaView? ImeView { get; set; }
 
 	/// <summary>
+	/// 避免在多次 show/hide 过程中重复订阅桥接事件。
+	/// 否则点一次 Hide 可能实际触发多次 RequestHideSelf，导致 IME 状态紊乱。
+	/// </summary>
+	private bool IsBridgeSubscribed { get; set; }
+
+	/// <summary>
 	/// 取得半屏高度，讓 IME 視圖與窗口尺寸保持一致。
 	/// </summary>
 	private int GetHalfScreenHeight() {
@@ -83,6 +89,7 @@ public sealed class ImeInputMethodService : InputMethodService {
 	public override void OnCreate() {
 		SetTheme(Resource.Style.MyTheme_Ime);
 		base.OnCreate();
+		SubscribeBridgeEvents();
 	}
 
 	/// <summary>
@@ -92,10 +99,6 @@ public sealed class ImeInputMethodService : InputMethodService {
 	public override void OnStartInputView(EditorInfo? info, bool restarting) {
 		base.OnStartInputView(info, restarting);
 		ReattachImeView();
-		ImeServiceBridge.Instance.CommitTextRequested += OnCommitTextRequested;
-		ImeServiceBridge.Instance.DeleteSurroundingTextRequested += OnDeleteSurroundingTextRequested;
-		ImeServiceBridge.Instance.KeyEventRequested += OnKeyEventRequested;
-		ImeServiceBridge.Instance.HideKeyboardRequested += OnHideKeyboardRequested;
 	}
 
 	/// <summary>
@@ -111,11 +114,45 @@ public sealed class ImeInputMethodService : InputMethodService {
 	/// 結束輸入視圖時只解除事件，不銷毀複用的 AvaloniaView。
 	/// </summary>
 	public override void OnFinishInputView(bool finishingInput) {
+		base.OnFinishInputView(finishingInput);
+	}
+
+	/// <summary>
+	/// Service 销毁时再统一解除订阅，避免悬挂引用。
+	/// </summary>
+	public override void OnDestroy() {
+		UnsubscribeBridgeEvents();
+		base.OnDestroy();
+	}
+
+	/// <summary>
+	/// 只订阅一次桥接事件，避免重复回调。
+	/// </summary>
+	private void SubscribeBridgeEvents() {
+		if (IsBridgeSubscribed) {
+			return;
+		}
+
+		ImeServiceBridge.Instance.CommitTextRequested += OnCommitTextRequested;
+		ImeServiceBridge.Instance.DeleteSurroundingTextRequested += OnDeleteSurroundingTextRequested;
+		ImeServiceBridge.Instance.KeyEventRequested += OnKeyEventRequested;
+		ImeServiceBridge.Instance.HideKeyboardRequested += OnHideKeyboardRequested;
+		IsBridgeSubscribed = true;
+	}
+
+	/// <summary>
+	/// 解除桥接事件订阅。
+	/// </summary>
+	private void UnsubscribeBridgeEvents() {
+		if (!IsBridgeSubscribed) {
+			return;
+		}
+
 		ImeServiceBridge.Instance.CommitTextRequested -= OnCommitTextRequested;
 		ImeServiceBridge.Instance.DeleteSurroundingTextRequested -= OnDeleteSurroundingTextRequested;
 		ImeServiceBridge.Instance.KeyEventRequested -= OnKeyEventRequested;
 		ImeServiceBridge.Instance.HideKeyboardRequested -= OnHideKeyboardRequested;
-		base.OnFinishInputView(finishingInput);
+		IsBridgeSubscribed = false;
 	}
 
 	/// <summary>
