@@ -16,75 +16,125 @@ namespace AvlnImeDemo.Android;
 [IntentFilter(new[] { "android.view.InputMethod" })]
 [MetaData("android.view.im", Resource = "@xml/ime_method")]
 public sealed class ImeInputMethodService : InputMethodService {
+	/// <summary>
+	/// 複用同一個 AvaloniaView，避免每次彈出鍵盤都重建整棵視圖樹。
+	/// </summary>
 	public AvaloniaView? ImeView { get; set; }
-	public bool ShouldRecreateImeView {
-		get=>false;
-		set{}
-	}
 
+	/// <summary>
+	/// 取得半屏高度，讓 IME 視圖與窗口尺寸保持一致。
+	/// </summary>
 	private int GetHalfScreenHeight() {
 		var screenHeight = Resources?.DisplayMetrics?.HeightPixels ?? 0;
 		return screenHeight > 0 ? screenHeight / 2 : ViewGroup.LayoutParams.WrapContent;
 	}
 
-	public override bool OnEvaluateFullscreenMode() {
-		return false;
-	}
-
-	public override void OnConfigureWindow(Window? win, bool isFullscreen, bool isCandidatesOnly) {
-		base.OnConfigureWindow(win, false, isCandidatesOnly);
-		win?.SetLayout(ViewGroup.LayoutParams.MatchParent, GetHalfScreenHeight());
-	}
-
-	public override global::Android.Views.View OnCreateInputView() {
-		if (ImeView is not null && !ShouldRecreateImeView) {
+	/// <summary>
+	/// IME 視圖只創建一次，後續都複用同一個實例。
+	/// </summary>
+	private AvaloniaView EnsureImeView() {
+		if (ImeView is not null) {
 			return ImeView;
 		}
 
 		ImeView = new AvaloniaView(this) {
 			Content = new ImeKeyboardView()
 		};
-		ImeView.LayoutParameters = new ViewGroup.LayoutParams(
-			ViewGroup.LayoutParams.MatchParent,
-			GetHalfScreenHeight()
-		);
-		ShouldRecreateImeView = false;
 		return ImeView;
 	}
 
+	/// <summary>
+	/// 同一個輸入框持續保持焦點時，Android 可能只重新顯示 IME window，
+	/// 但不會重新創建 input view。這裏主動把複用的 AvaloniaView 從舊父節點摘下，
+	/// 再交回 InputMethodService 重新掛載，並觸發一次 layout/draw。
+	/// </summary>
+	private void ReattachImeView() {
+		var imeView = EnsureImeView();
+		if (imeView.Parent is ViewGroup parent) {
+			parent.RemoveView(imeView);
+		}
+		SetInputView(imeView);
+		imeView.RequestLayout();
+		imeView.Invalidate();
+	}
+
+	public override bool OnEvaluateFullscreenMode() {
+		return false;
+	}
+
+	/// <summary>
+	/// 固定 IME 窗口高度，避免窗口尺寸變更與內容尺寸脫節。
+	/// </summary>
+	public override void OnConfigureWindow(Window? win, bool isFullscreen, bool isCandidatesOnly) {
+		base.OnConfigureWindow(win, false, isCandidatesOnly);
+		win?.SetLayout(ViewGroup.LayoutParams.MatchParent, GetHalfScreenHeight());
+	}
+
+	/// <summary>
+	/// 首次需要 input view 時返回複用的 AvaloniaView。
+	/// </summary>
+	public override global::Android.Views.View OnCreateInputView() {
+		return EnsureImeView();
+	}
+
+	/// <summary>
+	/// 先設置 IME 專用主題，再走基類初始化。
+	/// </summary>
 	public override void OnCreate() {
 		SetTheme(Resource.Style.MyTheme_Ime);
 		base.OnCreate();
 	}
 
+	/// <summary>
+	/// 每次開始顯示輸入視圖時都主動重掛複用的 AvaloniaView。
+	/// restarting=true 正是“同一個輸入框仍保持焦點”的場景。
+	/// </summary>
 	public override void OnStartInputView(EditorInfo? info, bool restarting) {
 		base.OnStartInputView(info, restarting);
-		if (ShouldRecreateImeView) {
-			SetInputView(OnCreateInputView());
-		}
+		ReattachImeView();
 		ImeServiceBridge.Instance.CommitTextRequested += OnCommitTextRequested;
 		ImeServiceBridge.Instance.DeleteSurroundingTextRequested += OnDeleteSurroundingTextRequested;
 		ImeServiceBridge.Instance.KeyEventRequested += OnKeyEventRequested;
 		ImeServiceBridge.Instance.HideKeyboardRequested += OnHideKeyboardRequested;
 	}
 
+	/// <summary>
+	/// 窗口真正顯示前再補一次重掛與重繪。
+	/// 這一層專門覆蓋“窗口回來了，但同一 editor 沒失焦”的場景。
+	/// </summary>
+	public override void OnWindowShown() {
+		base.OnWindowShown();
+		ReattachImeView();
+	}
+
+	/// <summary>
+	/// 結束輸入視圖時只解除事件，不銷毀複用的 AvaloniaView。
+	/// </summary>
 	public override void OnFinishInputView(bool finishingInput) {
 		ImeServiceBridge.Instance.CommitTextRequested -= OnCommitTextRequested;
 		ImeServiceBridge.Instance.DeleteSurroundingTextRequested -= OnDeleteSurroundingTextRequested;
 		ImeServiceBridge.Instance.KeyEventRequested -= OnKeyEventRequested;
 		ImeServiceBridge.Instance.HideKeyboardRequested -= OnHideKeyboardRequested;
-		ShouldRecreateImeView = true;
 		base.OnFinishInputView(finishingInput);
 	}
 
+	/// <summary>
+	/// 提交文本到當前聚焦的輸入框。
+	/// </summary>
 	private void OnCommitTextRequested(string text) {
 		CurrentInputConnection?.CommitText(text, 1);
 	}
 
+	/// <summary>
+	/// 刪除光標前方字符。
+	/// </summary>
 	private void OnDeleteSurroundingTextRequested(int beforeLength) {
 		CurrentInputConnection?.DeleteSurroundingText(beforeLength, 0);
 	}
 
+	/// <summary>
+	/// 把 Avalonia 內部按鍵映射成 Android key event。
+	/// </summary>
 	private void OnKeyEventRequested(string keyName) {
 		var keyCode = keyName switch {
 			"Enter" => global::Android.Views.Keycode.Enter,
@@ -101,6 +151,9 @@ public sealed class ImeInputMethodService : InputMethodService {
 		CurrentInputConnection?.SendKeyEvent(up);
 	}
 
+	/// <summary>
+	/// 請求 Android 隱藏當前輸入法窗口。
+	/// </summary>
 	private void OnHideKeyboardRequested() {
 		RequestHideSelf(0);
 	}
