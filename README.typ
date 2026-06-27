@@ -2,6 +2,7 @@
 #let H = auto-heading
 
 //Avalonia Android Input Method Editor (IME) Demo
+#link("./README.md")[English]
 #link("./README-zh-Hant.md")[繁體中文]
 #link("./README-zh-Hans.md")[简体中文]
 #H[Avalonia Android IME Proof of Concept][
@@ -82,4 +83,10 @@
 	````typst
 	The IME is taking up the full screen when it pops up. Adjust the height to half-screen.
 	````
+]
+
+
+#H[known issue][
+	keyboard may black out when hidden and then shown again with GPU rendering
+	#link("./HideKeyboard.typ")[record]
 ]

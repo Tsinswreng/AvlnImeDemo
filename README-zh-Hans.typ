@@ -82,3 +82,8 @@ avalonia android上应该能用完整的.net for android api。
 输入法弹出时候直接占满全屏了。高度给我调到半屏
 ````
 ]
+
+#H[已知問題][
+	鍵盤隱藏又彈出後使用GPU渲染有概率觸發黑屏
+	#link("./HideKeyboard.typ")[記錄]
+]
