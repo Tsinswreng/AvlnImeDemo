@@ -1,0 +1,20 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="AvlnImeDemo.Views.CandidateWindow"
+        Width="360"
+        SizeToContent="Height"
+        CanResize="False"
+        WindowDecorations="None"
+        ShowInTaskbar="False"
+        Topmost="True"
+        ShowActivated="False"
+        Opacity="0"
+        Background="#252A31"
+        TransparencyLevelHint="Transparent">
+  <Border Margin="1" Padding="12,8" BorderBrush="#6C7785" BorderThickness="1" Background="#252A31" CornerRadius="4">
+    <StackPanel Spacing="5">
+      <TextBlock Text="Ngan IME" FontSize="11" Foreground="#9DA9B8" />
+      <TextBlock x:Name="PreeditText" FontSize="18" Foreground="#F2F5F8" TextWrapping="Wrap" />
+    </StackPanel>
+  </Border>
+</Window>

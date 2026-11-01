@@ -3,22 +3,12 @@ using Avalonia;
 
 namespace AvlnImeDemo.Desktop;
 
-sealed class Program
+sealed partial class Program
 {
-    // Initialization code. Don't use any Avalonia, third-party APIs or any
-    // SynchronizationContext-reliant code before AppMain is called: things aren't initialized
-    // yet and stuff might break.
+    /// <summary>啟動候選窗，或向既有候選窗發出關閉請求。</summary>
     [STAThread]
-    public static void Main(string[] args) => BuildAvaloniaApp()
-        .StartWithClassicDesktopLifetime(args);
+    public static partial void Main(string[] Args);
 
-    // Avalonia configuration, don't remove; also used by visual designer.
-    public static AppBuilder BuildAvaloniaApp()
-        => AppBuilder.Configure<App>()
-            .UsePlatformDetect()
-#if DEBUG
-            .WithDeveloperTools()
-#endif
-            .WithInterFont()
-            .LogToTrace();
+    /// <summary>建立桌面 Avalonia 應用程式組態。</summary>
+    public static partial AppBuilder BuildAvaloniaApp();
 }
