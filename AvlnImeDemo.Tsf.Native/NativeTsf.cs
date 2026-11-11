@@ -28,6 +28,9 @@ internal static unsafe class NativeTsf {
     private static readonly Guid IidKeyEventSink = new("AA80E7F5-2021-11D2-93E0-0060B067B86E");
     /// <summary>ITfKeystrokeMgr。</summary>
     private static readonly Guid IidKeystrokeMgr = new("AA80E7F0-2021-11D2-93E0-0060B067B86E");
+    private static readonly Guid IidEditSession = new("AA80E803-2021-11D2-93E0-0060B067B86E");
+    private static readonly Guid IidContextComposition = new("D40C8AAE-AC92-4FC7-9A11-0EE0E23AA39B");
+    private static readonly Guid IidCompositionSink = new("A781718C-579A-4B15-A280-32B8577ACC5E");
 
     private const int SOk = 0;
     private const int SFalse = 1;
@@ -41,6 +44,17 @@ internal static unsafe class NativeTsf {
     private const int VkEscape = 0x1B;
     private const int VkSpace = 0x20;
 
+    private const uint TfEsSync = 0x1;
+    private const uint TfEsReadWrite = 0x6;
+    private const uint TfAnchorEnd = 1;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TfSelection {
+        public IntPtr Range;
+        public uint ActiveEnd;
+        public int Interim;
+    }
+
     /// <summary>候選窗的命名管道名稱，與 Avalonia 端的 CandidatePipeServer 一致。</summary>
     private const string PipeName = "AvlnImeDemo.CandidateWindow.v1";
 
@@ -49,6 +63,8 @@ internal static unsafe class NativeTsf {
     private static readonly IntPtr* TipVtbl;
     private static readonly IntPtr* SinkVtbl;
     private static readonly IntPtr* FactoryVtbl;
+    private static readonly IntPtr* EditSessionVtbl;
+    private static readonly IntPtr* CompSinkVtbl;
 
     private static readonly object FactoryGate = new();
     private static IntPtr FactoryView;
@@ -80,6 +96,18 @@ internal static unsafe class NativeTsf {
         FactoryVtbl[3] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, Guid*, IntPtr*, int>)&CreateInstanceEntry;
         FactoryVtbl[4] = (IntPtr)(delegate* unmanaged<IntPtr, int, int>)&LockServerEntry;
 
+        EditSessionVtbl = (IntPtr*)NativeMemory.Alloc(4, (nuint)sizeof(IntPtr));
+        EditSessionVtbl[0] = (IntPtr)(delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)&EditSessionQueryEntry;
+        EditSessionVtbl[1] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&AddRefEntry;
+        EditSessionVtbl[2] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&ReleaseEntry;
+        EditSessionVtbl[3] = (IntPtr)(delegate* unmanaged<IntPtr, uint, int>)&DoEditSessionEntry;
+
+        CompSinkVtbl = (IntPtr*)NativeMemory.Alloc(4, (nuint)sizeof(IntPtr));
+        CompSinkVtbl[0] = (IntPtr)(delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)&CompSinkQueryEntry;
+        CompSinkVtbl[1] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&AddRefEntry;
+        CompSinkVtbl[2] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&ReleaseEntry;
+        CompSinkVtbl[3] = (IntPtr)(delegate* unmanaged<IntPtr, uint, IntPtr, int>)&OnCompositionTerminatedEntry;
+
         RegisterCfgTargets();
         AddVectoredExceptionHandler(1, (IntPtr)(delegate* unmanaged<IntPtr, int>)&VectoredExceptionHandler);
         Log("NativeTsf static init pid=" + Environment.ProcessId);
@@ -103,6 +131,20 @@ internal static unsafe class NativeTsf {
         public IntPtr KeystrokeMgr;
         /// <summary>目前未上屏的 preedit 文字。</summary>
         public readonly StringBuilder Preedit = new();
+        /// <summary>ITfEditSession 的介面指標（自己實作，交給 ITfContext::RequestEditSession）。</summary>
+        public IntPtr EditSessionView;
+        /// <summary>ITfEditSession 的 GCHandle。</summary>
+        public IntPtr EditSessionHandle;
+        /// <summary>ITfCompositionSink 的介面指標。</summary>
+        public IntPtr CompSinkView;
+        /// <summary>ITfCompositionSink 的 GCHandle。</summary>
+        public IntPtr CompSinkHandle;
+        /// <summary>目前按鍵所屬的 ITfContext（只在 edit session 內有效）。</summary>
+        public IntPtr Context;
+        /// <summary>目前的 TSF composition；0 表示尚未建立。</summary>
+        public IntPtr Composition;
+        /// <summary>待執行的編輯操作：0 無、1 更新、2 上屏、3 取消。</summary>
+        public uint PendingOperation;
     }
 
     [UnmanagedCallersOnly(EntryPoint = "DllGetClassObject")]
@@ -183,6 +225,11 @@ internal static unsafe class NativeTsf {
             Interlocked.Increment(ref State.RefCount);
             return SOk;
         }
+        if (*Riid == IidCompositionSink) {
+            *Ppv = State.CompSinkView;
+            Interlocked.Increment(ref State.RefCount);
+            return SOk;
+        }
         *Ppv = IntPtr.Zero;
         return ENoInterface;
     }
@@ -227,6 +274,10 @@ internal static unsafe class NativeTsf {
             State.TipHandle = TipHandle;
             State.SinkView = MakeView(SinkVtbl, State, out var SinkHandle);
             State.SinkHandle = SinkHandle;
+            State.EditSessionView = MakeView(EditSessionVtbl, State, out var EditSessionHandle);
+            State.EditSessionHandle = EditSessionHandle;
+            State.CompSinkView = MakeView(CompSinkVtbl, State, out var CompSinkHandle);
+            State.CompSinkHandle = CompSinkHandle;
 
             if (*Riid == IidIUnknown || *Riid == IidTextInputProcessor) {
                 *Ppv = State.TipView;
@@ -331,6 +382,7 @@ internal static unsafe class NativeTsf {
                 ReleaseCom(State.KeystrokeMgr);
                 State.KeystrokeMgr = IntPtr.Zero;
             }
+            ReleaseComposition(State);
             lock (State) {
                 State.Preedit.Clear();
             }
@@ -351,6 +403,7 @@ internal static unsafe class NativeTsf {
             if (State is not null && IsForeground == 0) {
                 lock (State) {
                     State.Preedit.Clear();
+                    ReleaseComposition(State);
                 }
                 Send("HIDE");
             }
@@ -384,12 +437,32 @@ internal static unsafe class NativeTsf {
                 return EFail;
             }
             var VirtualKey = (int)WParam.ToInt64();
+            if (VirtualKey == VkBackspace) {
+                lock (State) {
+                    if (State.Preedit.Length > 0) {
+                        State.Preedit.Length--;
+                        *IsEaten = 1;
+                    }
+                    else {
+                        // 緩衝區空了就放行，讓應用程式自己處理退格。
+                        *IsEaten = 0;
+                    }
+                }
+                PublishPreedit(State);
+                return SOk;
+            }
             if (!IsSupported(VirtualKey)) {
                 *IsEaten = 0;
                 return SOk;
             }
             *IsEaten = 1;
             ApplyKey(State, VirtualKey);
+            if (VirtualKey == VkSpace) {
+                // 只有空白鍵才進編輯工作階段，把緩衝區文字插入文件。
+                var Hr = RequestEditSession(State, Context);
+                Log("OnKeyDown vk=" + VirtualKey + " commit hr=0x" + Hr.ToString("X8"));
+            }
+            PublishPreedit(State);
             return SOk;
         }
         catch (Exception Exception) {
@@ -425,28 +498,26 @@ internal static unsafe class NativeTsf {
         lock (State) {
             if (VirtualKey == VkEscape) {
                 State.Preedit.Clear();
-                Send("HIDE");
+                State.PendingOperation = 0;
                 return;
             }
             if (VirtualKey == VkSpace) {
-                State.Preedit.Clear();
-                Send("HIDE");
-                return;
-            }
-            if (VirtualKey == VkBackspace) {
-                if (State.Preedit.Length > 0) {
-                    State.Preedit.Length--;
-                }
-                if (State.Preedit.Length == 0) {
-                    Send("HIDE");
-                }
-                else {
-                    SendShow(State.Preedit.ToString());
-                }
+                State.PendingOperation = 2;
                 return;
             }
             State.Preedit.Append(char.ToLowerInvariant((char)VirtualKey));
-            SendShow(State.Preedit.ToString());
+            State.PendingOperation = 0;
+        }
+    }
+
+    private static void PublishPreedit(TsfState State) {
+        lock (State) {
+            if (State.Preedit.Length == 0) {
+                Send("HIDE");
+            }
+            else {
+                SendShow(State.Preedit.ToString());
+            }
         }
     }
 
@@ -470,6 +541,235 @@ internal static unsafe class NativeTsf {
         var Vtbl = *(IntPtr***)ComObject;
         var Release = (delegate* unmanaged<IntPtr, int>)Vtbl[2];
         Release(ComObject);
+    }
+
+    private static int RequestEditSession(TsfState State, IntPtr Context) {
+        State.Context = Context;
+        var Vtbl = *(IntPtr**)Context;
+        var Request = (delegate* unmanaged<IntPtr, uint, IntPtr, uint, int*, int>)Vtbl[3];
+        var SessionResult = 0;
+        var Hr = Request(Context, State.ClientId, State.EditSessionView, TfEsSync | TfEsReadWrite, &SessionResult);
+        if (Hr < 0) {
+            Log("RequestEditSession hr=0x" + Hr.ToString("X8"));
+            return Hr;
+        }
+        return SessionResult;
+    }
+
+    private static int DoEditSessionCore(IntPtr ThisPtr, uint EditCookie) {
+        try {
+            var State = GetState(ThisPtr);
+            if (State is null) {
+                return EFail;
+            }
+            lock (State) {
+                var Operation = State.PendingOperation;
+                State.PendingOperation = 0;
+                Log("DoEditSession op=" + Operation + " ec=0x" + EditCookie.ToString("X") + " text=[" + State.Preedit + "]");
+                return Operation switch {
+                    2 => InsertTextCore(State, EditCookie),
+                    _ => SOk,
+                };
+            }
+        }
+        catch (Exception Exception) {
+            Log("DoEditSession EX " + Exception);
+            return EFail;
+        }
+    }
+
+    /// <summary>
+    /// 把目前 preedit 緩衝區的文字插入游標位置。
+    /// 打字過程中完全不碰文件，只有空白鍵上屏時才呼叫 ITfRange::SetText。
+    /// </summary>
+    private static int InsertTextCore(TsfState State, uint EditCookie) {
+        var ContextVtbl = *(IntPtr**)State.Context;
+        var GetSelection = (delegate* unmanaged<IntPtr, uint, uint, uint, TfSelection*, uint*, int>)ContextVtbl[5];
+        var Selection = default(TfSelection);
+        uint Fetched = 0;
+        var Hr = GetSelection(State.Context, EditCookie, 0, 1, &Selection, &Fetched);
+        Log("InsertText GetSelection hr=0x" + Hr.ToString("X8") + " fetched=" + Fetched);
+        if (Hr < 0) {
+            return Hr;
+        }
+        if (Fetched != 1 || Selection.Range == IntPtr.Zero) {
+            return EFail;
+        }
+        var RangeVtbl = *(IntPtr**)Selection.Range;
+        var SetText = (delegate* unmanaged<IntPtr, uint, uint, char*, int, int>)RangeVtbl[4];
+        var Text = State.Preedit.ToString();
+        fixed (char* TextPtr = Text) {
+            Hr = SetText(Selection.Range, EditCookie, 0, TextPtr, Text.Length);
+        }
+        Log("InsertText SetText hr=0x" + Hr.ToString("X8") + " len=" + Text.Length);
+        if (Hr >= 0) {
+            var Collapse = (delegate* unmanaged<IntPtr, uint, uint, int>)RangeVtbl[15];
+            var CollapseHr = Collapse(Selection.Range, EditCookie, TfAnchorEnd);
+            Log("InsertText Collapse hr=0x" + CollapseHr.ToString("X8"));
+        }
+        ReleaseCom(Selection.Range);
+        State.Preedit.Clear();
+        return Hr;
+    }
+
+    private static int UpdateCompositionCore(TsfState State, uint EditCookie) {
+        if (State.Composition == IntPtr.Zero) {
+            var StartHr = StartCompositionCore(State, EditCookie);
+            if (StartHr < 0) {
+                return StartHr;
+            }
+        }
+        return SetCompositionText(State, EditCookie, State.Preedit.ToString());
+    }
+
+    private static int StartCompositionCore(TsfState State, uint EditCookie) {
+        var ContextVtbl = *(IntPtr**)State.Context;
+        var GetSelection = (delegate* unmanaged<IntPtr, uint, uint, uint, TfSelection*, uint*, int>)ContextVtbl[5];
+        var Selection = default(TfSelection);
+        uint Fetched = 0;
+        var Hr = GetSelection(State.Context, EditCookie, 0, 1, &Selection, &Fetched);
+        Log("GetSelection hr=0x" + Hr.ToString("X8") + " fetched=" + Fetched);
+        if (Hr < 0) {
+            return Hr;
+        }
+        if (Fetched != 1 || Selection.Range == IntPtr.Zero) {
+            return EFail;
+        }
+        var QueryInterface = (delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)ContextVtbl[0];
+        var Iid = IidContextComposition;
+        IntPtr Composer = IntPtr.Zero;
+        Hr = QueryInterface(State.Context, &Iid, &Composer);
+        Log("QI ITfContextComposition hr=0x" + Hr.ToString("X8"));
+        if (Hr < 0) {
+            ReleaseCom(Selection.Range);
+            return Hr;
+        }
+        var ComposerVtbl = *(IntPtr**)Composer;
+        var Start = (delegate* unmanaged<IntPtr, uint, IntPtr, IntPtr, IntPtr*, int>)ComposerVtbl[3];
+        IntPtr Composition = IntPtr.Zero;
+        Hr = Start(Composer, EditCookie, Selection.Range, State.CompSinkView, &Composition);
+        Log("StartComposition hr=0x" + Hr.ToString("X8") + " comp=" + Composition.ToString("X"));
+        Log("before release composer");
+        ReleaseCom(Composer);
+        Log("before release selection");
+        ReleaseCom(Selection.Range);
+        Log("after releases");
+        if (Hr < 0) {
+            return Hr;
+        }
+        State.Composition = Composition;
+        return SOk;
+    }
+
+    private static int SetCompositionText(TsfState State, uint EditCookie, string Text) {
+        if (State.Composition == IntPtr.Zero) {
+            return EFail;
+        }
+        Log("SetCompositionText comp=" + State.Composition.ToString("X"));
+        var CompositionVtbl = *(IntPtr**)State.Composition;
+        Log("SetCompositionText vtbl=" + ((IntPtr)CompositionVtbl).ToString("X"));
+        // 這裡的 slot 3 其實吃 (ITfRange**)，不吃 ec（用 dump 反組譯 textinputframework 確認過）。
+        var GetRange = (delegate* unmanaged<IntPtr, IntPtr*, int>)CompositionVtbl[3];
+        IntPtr Range = IntPtr.Zero;
+        var Hr = GetRange(State.Composition, &Range);
+        Log("GetRange hr=0x" + Hr.ToString("X8") + " range=" + Range.ToString("X"));
+        if (Hr < 0 || Range == IntPtr.Zero) {
+            Log("Composition.GetRange hr=0x" + Hr.ToString("X8"));
+            return Hr < 0 ? Hr : EFail;
+        }
+        var RangeVtbl = *(IntPtr**)Range;
+        Log("Range vtbl=" + ((IntPtr)RangeVtbl).ToString("X"));
+        var SetText = (delegate* unmanaged<IntPtr, uint, uint, char*, int, int>)RangeVtbl[4];
+        fixed (char* TextPtr = Text) {
+            Log("SetText calling len=" + Text.Length);
+            Hr = SetText(Range, EditCookie, 0, TextPtr, Text.Length);
+        }
+        Log("Range.SetText hr=0x" + Hr.ToString("X8") + " len=" + Text.Length);
+        if (Hr >= 0) {
+            var Collapse = (delegate* unmanaged<IntPtr, uint, uint, int>)RangeVtbl[15];
+            var CollapseHr = Collapse(Range, EditCookie, TfAnchorEnd);
+            Log("Range.Collapse hr=0x" + CollapseHr.ToString("X8"));
+            Hr = CollapseHr;
+        }
+        ReleaseCom(Range);
+        return Hr;
+    }
+
+    private static int EndCompositionCore(TsfState State, uint EditCookie, bool ClearText) {
+        if (State.Composition == IntPtr.Zero) {
+            State.Preedit.Clear();
+            return SOk;
+        }
+        if (ClearText) {
+            SetCompositionText(State, EditCookie, string.Empty);
+        }
+        var CompositionVtbl = *(IntPtr**)State.Composition;
+        var End = (delegate* unmanaged<IntPtr, uint, int>)CompositionVtbl[6];
+        var Hr = End(State.Composition, EditCookie);
+        Log("EndComposition hr=0x" + Hr.ToString("X8"));
+        ReleaseCom(State.Composition);
+        State.Composition = IntPtr.Zero;
+        State.Preedit.Clear();
+        return Hr;
+    }
+
+    private static void ReleaseComposition(TsfState State) {
+        if (State.Composition != IntPtr.Zero) {
+            try {
+                ReleaseCom(State.Composition);
+            }
+            catch (Exception Exception) {
+                Log("ReleaseComposition EX " + Exception);
+            }
+            State.Composition = IntPtr.Zero;
+        }
+    }
+
+    private static int OnCompositionTerminatedCore(IntPtr ThisPtr, uint EditCookie, IntPtr Composition) {
+        try {
+            var State = GetState(ThisPtr);
+            if (State is null) {
+                return EFail;
+            }
+            lock (State) {
+                Log("OnCompositionTerminated cookie=" + EditCookie);
+                State.Composition = IntPtr.Zero;
+                State.Preedit.Clear();
+            }
+            return SOk;
+        }
+        catch (Exception Exception) {
+            Log("OnCompositionTerminated EX " + Exception);
+            return EFail;
+        }
+    }
+
+    private static int EditSessionQueryCore(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) {
+        var State = GetState(ThisPtr);
+        if (State is null) {
+            return ENoInterface;
+        }
+        if (*Riid == IidIUnknown || *Riid == IidEditSession) {
+            *Ppv = ThisPtr;
+            Interlocked.Increment(ref State.RefCount);
+            return SOk;
+        }
+        *Ppv = IntPtr.Zero;
+        return ENoInterface;
+    }
+
+    private static int CompSinkQueryCore(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) {
+        var State = GetState(ThisPtr);
+        if (State is null) {
+            return ENoInterface;
+        }
+        if (*Riid == IidIUnknown || *Riid == IidCompositionSink) {
+            *Ppv = ThisPtr;
+            Interlocked.Increment(ref State.RefCount);
+            return SOk;
+        }
+        *Ppv = IntPtr.Zero;
+        return ENoInterface;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -505,6 +805,8 @@ internal static unsafe class NativeTsf {
             CollectTargets(TipVtbl, 5, Targets);
             CollectTargets(SinkVtbl, 9, Targets);
             CollectTargets(FactoryVtbl, 5, Targets);
+            CollectTargets(EditSessionVtbl, 4, Targets);
+            CollectTargets(CompSinkVtbl, 4, Targets);
             foreach (var Target in Targets) {
                 var Page = (IntPtr)(Target.ToInt64() & ~0xFFFL);
                 var Info = new[] { new CfgCallTargetInfo { Offset = (IntPtr)(Target.ToInt64() - Page.ToInt64()), Flags = (IntPtr)1 } };
@@ -550,6 +852,18 @@ internal static unsafe class NativeTsf {
         catch {
         }
     }
+
+    [UnmanagedCallersOnly]
+    private static int EditSessionQueryEntry(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) => EditSessionQueryCore(ThisPtr, Riid, Ppv);
+
+    [UnmanagedCallersOnly]
+    private static int DoEditSessionEntry(IntPtr ThisPtr, uint EditCookie) => DoEditSessionCore(ThisPtr, EditCookie);
+
+    [UnmanagedCallersOnly]
+    private static int CompSinkQueryEntry(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) => CompSinkQueryCore(ThisPtr, Riid, Ppv);
+
+    [UnmanagedCallersOnly]
+    private static int OnCompositionTerminatedEntry(IntPtr ThisPtr, uint EditCookie, IntPtr Composition) => OnCompositionTerminatedCore(ThisPtr, EditCookie, Composition);
 
     [UnmanagedCallersOnly]
     private static int QueryInterfaceEntry(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) { Log("QI-entry this=" + ThisPtr.ToString("X")); return QueryCore(ThisPtr, Riid, Ppv); }
