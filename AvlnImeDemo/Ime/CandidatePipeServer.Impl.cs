@@ -44,8 +44,16 @@ internal static class CandidatePipeServerImpl {
             return;
         }
         try {
-            var Preedit = Encoding.UTF8.GetString(Convert.FromBase64String(Message[ShowPrefix.Length..]));
-            Dispatcher.UIThread.Post(() => Window.ShowPreedit(Preedit));
+            var Payload = Message[ShowPrefix.Length..];
+            // 新格式：SHOW|x|y|base64；舊格式：SHOW|base64。
+            var Parts = Payload.Split('|');
+            if (Parts.Length == 3 && int.TryParse(Parts[0], out var X) && int.TryParse(Parts[1], out var Y)) {
+                var Preedit = Encoding.UTF8.GetString(Convert.FromBase64String(Parts[2]));
+                Dispatcher.UIThread.Post(() => Window.ShowPreeditAt(Preedit, X, Y));
+                return;
+            }
+            var Legacy = Encoding.UTF8.GetString(Convert.FromBase64String(Payload));
+            Dispatcher.UIThread.Post(() => Window.ShowPreedit(Legacy));
         }
         catch (FormatException) {
             // Ignore malformed input instead of allowing another process to terminate the UI loop.

@@ -45,8 +45,17 @@ internal static unsafe class NativeTsf {
     private const int VkSpace = 0x20;
 
     private const uint TfEsSync = 0x1;
+    private const uint TfEsRead = 0x2;
     private const uint TfEsReadWrite = 0x6;
     private const uint TfAnchorEnd = 1;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct TfSelection {
@@ -143,8 +152,12 @@ internal static unsafe class NativeTsf {
         public IntPtr Context;
         /// <summary>目前的 TSF composition；0 表示尚未建立。</summary>
         public IntPtr Composition;
-        /// <summary>待執行的編輯操作：0 無、1 更新、2 上屏、3 取消。</summary>
+        /// <summary>待執行的編輯操作：0 無、1 取游標位置、2 上屏。</summary>
         public uint PendingOperation;
+        /// <summary>游標在螢幕上的左邊界（像素）。</summary>
+        public int CaretX;
+        /// <summary>游標在螢幕上的下邊界（像素）。</summary>
+        public int CaretY;
     }
 
     [UnmanagedCallersOnly(EntryPoint = "DllGetClassObject")]
@@ -418,8 +431,17 @@ internal static unsafe class NativeTsf {
     private static int OnTestKeyDownCore(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) {
         try {
             var VirtualKey = (int)WParam.ToInt64();
-            Log("OnTestKeyDown vk=" + VirtualKey);
-            *IsEaten = IsSupported(VirtualKey) ? 1 : 0;
+            var State = GetState(ThisPtr);
+            var HasPreedit = State is not null && State.Preedit.Length > 0;
+            // 有緩衝文字時才吃掉空白／退格／Esc；緩衝區空了就放行給應用程式。
+            var Eat = VirtualKey switch {
+                VkBackspace => HasPreedit,
+                VkEscape => HasPreedit,
+                VkSpace => HasPreedit,
+                _ => IsSupported(VirtualKey),
+            };
+            Log("OnTestKeyDown vk=" + VirtualKey + " eat=" + (Eat ? 1 : 0));
+            *IsEaten = Eat ? 1 : 0;
             return SOk;
         }
         catch (Exception Exception) {
@@ -457,10 +479,10 @@ internal static unsafe class NativeTsf {
             }
             *IsEaten = 1;
             ApplyKey(State, VirtualKey);
-            if (VirtualKey == VkSpace) {
-                // 只有空白鍵才進編輯工作階段，把緩衝區文字插入文件。
+            if (State.PendingOperation != 0) {
+                // 字母鍵只取游標位置；空白鍵才真的寫入文件。
                 var Hr = RequestEditSession(State, Context);
-                Log("OnKeyDown vk=" + VirtualKey + " commit hr=0x" + Hr.ToString("X8"));
+                Log("OnKeyDown vk=" + VirtualKey + " hr=0x" + Hr.ToString("X8"));
             }
             PublishPreedit(State);
             return SOk;
@@ -506,7 +528,7 @@ internal static unsafe class NativeTsf {
                 return;
             }
             State.Preedit.Append(char.ToLowerInvariant((char)VirtualKey));
-            State.PendingOperation = 0;
+            State.PendingOperation = 1;
         }
     }
 
@@ -516,13 +538,13 @@ internal static unsafe class NativeTsf {
                 Send("HIDE");
             }
             else {
-                SendShow(State.Preedit.ToString());
+                SendShow(State.Preedit.ToString(), State.CaretX, State.CaretY);
             }
         }
     }
 
-    private static void SendShow(string Preedit) {
-        Send("SHOW|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(Preedit)));
+    private static void SendShow(string Preedit, int X, int Y) {
+        Send("SHOW|" + X + "|" + Y + "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(Preedit)));
     }
 
     private static void Send(string Message) {
@@ -548,7 +570,8 @@ internal static unsafe class NativeTsf {
         var Vtbl = *(IntPtr**)Context;
         var Request = (delegate* unmanaged<IntPtr, uint, IntPtr, uint, int*, int>)Vtbl[3];
         var SessionResult = 0;
-        var Hr = Request(Context, State.ClientId, State.EditSessionView, TfEsSync | TfEsReadWrite, &SessionResult);
+        var Flags = State.PendingOperation == 2 ? (TfEsSync | TfEsReadWrite) : (TfEsSync | TfEsRead);
+        var Hr = Request(Context, State.ClientId, State.EditSessionView, Flags, &SessionResult);
         if (Hr < 0) {
             Log("RequestEditSession hr=0x" + Hr.ToString("X8"));
             return Hr;
@@ -567,6 +590,7 @@ internal static unsafe class NativeTsf {
                 State.PendingOperation = 0;
                 Log("DoEditSession op=" + Operation + " ec=0x" + EditCookie.ToString("X") + " text=[" + State.Preedit + "]");
                 return Operation switch {
+                    1 => UpdateCaretCore(State, EditCookie),
                     2 => InsertTextCore(State, EditCookie),
                     _ => SOk,
                 };
@@ -576,6 +600,46 @@ internal static unsafe class NativeTsf {
             Log("DoEditSession EX " + Exception);
             return EFail;
         }
+    }
+
+    /// <summary>
+    /// 取得目前選取範圍（游標）在螢幕上的矩形，換算候選窗要出現的位置。
+    /// 需要 edit session 才能呼叫 ITfContext::GetActiveView 與 ITfContextView::GetTextExt。
+    /// </summary>
+    private static int UpdateCaretCore(TsfState State, uint EditCookie) {
+        var ContextVtbl = *(IntPtr**)State.Context;
+        var GetSelection = (delegate* unmanaged<IntPtr, uint, uint, uint, TfSelection*, uint*, int>)ContextVtbl[5];
+        var Selection = default(TfSelection);
+        uint Fetched = 0;
+        var Hr = GetSelection(State.Context, EditCookie, 0, 1, &Selection, &Fetched);
+        if (Hr < 0 || Fetched != 1 || Selection.Range == IntPtr.Zero) {
+            Log("UpdateCaret GetSelection hr=0x" + Hr.ToString("X8"));
+            return SOk;
+        }
+        var GetActiveView = (delegate* unmanaged<IntPtr, uint, IntPtr*, int>)ContextVtbl[9];
+        IntPtr View = IntPtr.Zero;
+        Hr = GetActiveView(State.Context, EditCookie, &View);
+        if (Hr >= 0 && View != IntPtr.Zero) {
+            var ViewVtbl = *(IntPtr**)View;
+            var GetTextExt = (delegate* unmanaged<IntPtr, uint, IntPtr, NativeRect*, int*, int>)ViewVtbl[4];
+            var Rect = default(NativeRect);
+            var Clipped = 0;
+            Hr = GetTextExt(View, EditCookie, Selection.Range, &Rect, &Clipped);
+            if (Hr >= 0) {
+                State.CaretX = Rect.Left;
+                State.CaretY = Rect.Bottom;
+                Log("UpdateCaret x=" + Rect.Left + " y=" + Rect.Bottom + " clipped=" + Clipped);
+            }
+            else {
+                Log("GetTextExt hr=0x" + Hr.ToString("X8"));
+            }
+            ReleaseCom(View);
+        }
+        else {
+            Log("GetActiveView hr=0x" + Hr.ToString("X8"));
+        }
+        ReleaseCom(Selection.Range);
+        return SOk;
     }
 
     /// <summary>
