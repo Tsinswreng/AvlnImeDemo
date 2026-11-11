@@ -529,6 +529,11 @@ internal static unsafe class NativeTsf {
                 return;
             }
             State.Preedit.Append(char.ToLowerInvariant((char)VirtualKey));
+            // 示範：輸入 h 時候選顯示「漢」，空白鍵上屏「漢」。
+            if (State.Preedit.ToString() == "h") {
+                State.Preedit.Clear();
+                State.Preedit.Append("漢");
+            }
             State.PendingOperation = 0;
         }
     }
