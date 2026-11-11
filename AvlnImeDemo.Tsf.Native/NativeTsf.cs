@@ -1,0 +1,601 @@
+namespace AvlnImeDemo.Tsf.Native;
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+/// <summary>
+/// NativeAOT 版的 TSF 薄外殼。整個 DLL 不帶 CLR，只做三件事：
+/// 1. 提供 DllGetClassObject 與 IClassFactory，讓 Windows 建立文字服務；
+/// 2. 實作 ITfTextInputProcessor 與 ITfKeyEventSink 的 vtable（手寫，不用內建 COM）；
+/// 3. 把 preedit 透過既有命名管道丟給 Avalonia 候選窗，文件內容留到後續階段。
+/// </summary>
+internal static unsafe class NativeTsf {
+    /// <summary>本 POC 的文字服務 CLSID，必須與註冊工具寫入的 InprocServer32 對應。</summary>
+    internal static readonly Guid Clsid = new("C6A66736-6E5E-4B4E-8B3A-6C2D2A9D4E11");
+
+    /// <summary>標準 COM 介面識別碼。</summary>
+    private static readonly Guid IidIUnknown = new("00000000-0000-0000-C000-000000000046");
+    /// <summary>IClassFactory。</summary>
+    private static readonly Guid IidClassFactory = new("00000001-0000-0000-C000-000000000046");
+    /// <summary>ITfTextInputProcessor。</summary>
+    private static readonly Guid IidTextInputProcessor = new("AA80E7F7-2021-11D2-93E0-0060B067B86E");
+    /// <summary>ITfKeyEventSink。</summary>
+    private static readonly Guid IidKeyEventSink = new("AA80E7F5-2021-11D2-93E0-0060B067B86E");
+    /// <summary>ITfKeystrokeMgr。</summary>
+    private static readonly Guid IidKeystrokeMgr = new("AA80E7F0-2021-11D2-93E0-0060B067B86E");
+
+    private const int SOk = 0;
+    private const int SFalse = 1;
+    private const int ENoInterface = unchecked((int)0x80004002);
+    private const int EFail = unchecked((int)0x80004005);
+    private const int EClassNotAvailable = unchecked((int)0x80040111);
+    private const int EInvalidArg = unchecked((int)0x80070057);
+    private const int ENoAggregation = unchecked((int)0x80040110);
+
+    private const int VkBackspace = 0x08;
+    private const int VkEscape = 0x1B;
+    private const int VkSpace = 0x20;
+
+    /// <summary>候選窗的命名管道名稱，與 Avalonia 端的 CandidatePipeServer 一致。</summary>
+    private const string PipeName = "AvlnImeDemo.CandidateWindow.v1";
+
+    private static readonly object LogGate = new();
+
+    private static readonly IntPtr* TipVtbl;
+    private static readonly IntPtr* SinkVtbl;
+    private static readonly IntPtr* FactoryVtbl;
+
+    private static readonly object FactoryGate = new();
+    private static IntPtr FactoryView;
+    private static int FactoryRefCount = 1;
+
+    static NativeTsf() {
+        TipVtbl = (IntPtr*)NativeMemory.Alloc(5, (nuint)sizeof(IntPtr));
+        TipVtbl[0] = (IntPtr)(delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)&QueryInterfaceEntry;
+        TipVtbl[1] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&AddRefEntry;
+        TipVtbl[2] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&ReleaseEntry;
+        TipVtbl[3] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, uint, int>)&ActivateEntry;
+        TipVtbl[4] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&DeactivateEntry;
+
+        SinkVtbl = (IntPtr*)NativeMemory.Alloc(9, (nuint)sizeof(IntPtr));
+        SinkVtbl[0] = (IntPtr)(delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)&QueryInterfaceEntry;
+        SinkVtbl[1] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&AddRefEntry;
+        SinkVtbl[2] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&ReleaseEntry;
+        SinkVtbl[3] = (IntPtr)(delegate* unmanaged<IntPtr, int, int>)&OnSetFocusEntry;
+        SinkVtbl[4] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr, int*, int>)&OnTestKeyDownEntry;
+        SinkVtbl[5] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr, int*, int>)&OnTestKeyUpEntry;
+        SinkVtbl[6] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr, int*, int>)&OnKeyDownEntry;
+        SinkVtbl[7] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, IntPtr, IntPtr, int*, int>)&OnKeyUpEntry;
+        SinkVtbl[8] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, Guid*, int*, int>)&OnPreservedKeyEntry;
+
+        FactoryVtbl = (IntPtr*)NativeMemory.Alloc(5, (nuint)sizeof(IntPtr));
+        FactoryVtbl[0] = (IntPtr)(delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)&FactoryQueryInterfaceEntry;
+        FactoryVtbl[1] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&FactoryAddRefEntry;
+        FactoryVtbl[2] = (IntPtr)(delegate* unmanaged<IntPtr, int>)&FactoryReleaseEntry;
+        FactoryVtbl[3] = (IntPtr)(delegate* unmanaged<IntPtr, IntPtr, Guid*, IntPtr*, int>)&CreateInstanceEntry;
+        FactoryVtbl[4] = (IntPtr)(delegate* unmanaged<IntPtr, int, int>)&LockServerEntry;
+
+        RegisterCfgTargets();
+        AddVectoredExceptionHandler(1, (IntPtr)(delegate* unmanaged<IntPtr, int>)&VectoredExceptionHandler);
+        Log("NativeTsf static init pid=" + Environment.ProcessId);
+    }
+
+    /// <summary>單一文字服務執行個體的狀態；兩個介面指標共用同一份參考計數。</summary>
+    private sealed class TsfState {
+        /// <summary>COM 參考計數，兩個 view 共用。</summary>
+        public int RefCount = 1;
+        /// <summary>ITfTextInputProcessor 的介面指標。</summary>
+        public IntPtr TipView;
+        /// <summary>ITfKeyEventSink 的介面指標。</summary>
+        public IntPtr SinkView;
+        /// <summary>對應的 GCHandle，釋放時要一起 Free。</summary>
+        public IntPtr TipHandle;
+        /// <summary>對應的 GCHandle，釋放時要一起 Free。</summary>
+        public IntPtr SinkHandle;
+        /// <summary>TSF 指派的 client id。</summary>
+        public uint ClientId;
+        /// <summary>ITfKeystrokeMgr 的原始指標，Deactivate 時釋放。</summary>
+        public IntPtr KeystrokeMgr;
+        /// <summary>目前未上屏的 preedit 文字。</summary>
+        public readonly StringBuilder Preedit = new();
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "DllGetClassObject")]
+    private static int DllGetClassObject(Guid* Rclsid, Guid* Riid, IntPtr* Ppv) {
+        try {
+            Log("DllGetClassObject");
+            if (Rclsid is null || Riid is null || Ppv is null) {
+                return EInvalidArg;
+            }
+            if (*Rclsid != Clsid) {
+                return EClassNotAvailable;
+            }
+            EnsureFactory();
+            return FactoryQueryCore(FactoryView, Riid, Ppv);
+        }
+        catch (Exception Exception) {
+            Log("DllGetClassObject EX " + Exception);
+            return EFail;
+        }
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "DllCanUnloadNow")]
+    private static int DllCanUnloadNow() {
+        return SFalse;
+    }
+
+    private static void EnsureFactory() {
+        lock (FactoryGate) {
+            if (FactoryView == IntPtr.Zero) {
+                var Block = (IntPtr*)NativeMemory.Alloc(2, (nuint)sizeof(IntPtr));
+                Block[0] = (IntPtr)FactoryVtbl;
+                Block[1] = IntPtr.Zero;
+                FactoryView = (IntPtr)Block;
+            }
+        }
+    }
+
+    private static IntPtr MakeView(IntPtr* Vtbl, TsfState State, out IntPtr Handle) {
+        var Block = (IntPtr*)NativeMemory.Alloc(2, (nuint)sizeof(IntPtr));
+        Block[0] = (IntPtr)Vtbl;
+        var GcHandle = GCHandle.Alloc(State);
+        Handle = GCHandle.ToIntPtr(GcHandle);
+        Block[1] = Handle;
+        return (IntPtr)Block;
+    }
+
+    private static TsfState? GetState(IntPtr ThisPtr) {
+        if (ThisPtr == IntPtr.Zero) {
+            return null;
+        }
+        var Block = (IntPtr*)ThisPtr;
+        var Handle = Block[1];
+        if (Handle == IntPtr.Zero) {
+            return null;
+        }
+        return GCHandle.FromIntPtr(Handle).Target as TsfState;
+    }
+
+    private static int QueryCore(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) {
+        Log("QI core this=" + ThisPtr.ToString("X"));
+        var State = GetState(ThisPtr);
+        if (State is null) {
+            return ENoInterface;
+        }
+        Log("QI " + *Riid + " this=" + ThisPtr.ToString("X"));
+        if (*Riid == IidIUnknown) {
+            *Ppv = ThisPtr;
+            Interlocked.Increment(ref State.RefCount);
+            return SOk;
+        }
+        if (*Riid == IidTextInputProcessor) {
+            *Ppv = State.TipView;
+            Interlocked.Increment(ref State.RefCount);
+            return SOk;
+        }
+        if (*Riid == IidKeyEventSink) {
+            *Ppv = State.SinkView;
+            Interlocked.Increment(ref State.RefCount);
+            return SOk;
+        }
+        *Ppv = IntPtr.Zero;
+        return ENoInterface;
+    }
+
+    private static int AddRefCore(IntPtr ThisPtr) {
+        var State = GetState(ThisPtr);
+        var Count = State is null ? 0 : Interlocked.Increment(ref State.RefCount);
+        Log("AddRef this=" + ThisPtr.ToString("X") + " -> " + Count);
+        return Count;
+    }
+
+    private static int ReleaseCore(IntPtr ThisPtr) {
+        var State = GetState(ThisPtr);
+        if (State is null) {
+            return 0;
+        }
+        var Count = Interlocked.Decrement(ref State.RefCount);
+        Log("Release this=" + ThisPtr.ToString("X") + " -> " + Count);
+        // POC：物件在行程生命期內不釋放。
+        // 之前一旦參考計數歸零就釋放 view，結果 TSF 之後仍拿著 sink 指標，拿到失效記憶體。
+        return Count;
+    }
+
+    private static int FactoryQueryCore(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) {
+        if (*Riid == IidIUnknown || *Riid == IidClassFactory) {
+            *Ppv = ThisPtr;
+            Interlocked.Increment(ref FactoryRefCount);
+            return SOk;
+        }
+        *Ppv = IntPtr.Zero;
+        return ENoInterface;
+    }
+
+    private static int CreateInstanceCore(IntPtr ThisPtr, IntPtr Outer, Guid* Riid, IntPtr* Ppv) {
+        try {
+            if (Outer != IntPtr.Zero) {
+                return ENoAggregation;
+            }
+            Log("CreateInstance riid=" + *Riid);
+            var State = new TsfState();
+            State.TipView = MakeView(TipVtbl, State, out var TipHandle);
+            State.TipHandle = TipHandle;
+            State.SinkView = MakeView(SinkVtbl, State, out var SinkHandle);
+            State.SinkHandle = SinkHandle;
+
+            if (*Riid == IidIUnknown || *Riid == IidTextInputProcessor) {
+                *Ppv = State.TipView;
+                return SOk;
+            }
+            if (*Riid == IidKeyEventSink) {
+                *Ppv = State.SinkView;
+                return SOk;
+            }
+            *Ppv = IntPtr.Zero;
+            return ENoInterface;
+        }
+        catch (Exception Exception) {
+            Log("CreateInstance EX " + Exception);
+            return EFail;
+        }
+    }
+
+    private static int ActivateCore(IntPtr ThisPtr, IntPtr ThreadManager, uint ClientId) {
+        try {
+            var State = GetState(ThisPtr);
+            if (State is null) {
+                return EFail;
+            }
+            State.ClientId = ClientId;
+            var iid = IidKeystrokeMgr;
+            var ThreadVtbl = *(IntPtr***)ThreadManager;
+            var QueryInterface = (delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)ThreadVtbl[0];
+            IntPtr KeystrokeMgr = IntPtr.Zero;
+            var Hr = QueryInterface(ThreadManager, &iid, &KeystrokeMgr);
+            Log("Activate QI keystrokeMgr hr=0x" + Hr.ToString("X8"));
+            if (Hr < 0) {
+                return Hr;
+            }
+            var KsVtbl = *(IntPtr***)KeystrokeMgr;
+            Log("Activate ksm=" + KeystrokeMgr.ToString("X") + " vtbl=" + ((IntPtr)KsVtbl).ToString("X") + " slot0=" + ((IntPtr)KsVtbl[0]).ToString("X") + " slot1=" + ((IntPtr)KsVtbl[1]).ToString("X"));
+            var Mode = Environment.GetEnvironmentVariable("NGAN_TSF_MODE") ?? "advise";
+            Log("Activate mode=" + Mode);
+            if (Mode == "none") {
+                State.KeystrokeMgr = KeystrokeMgr;
+                return SOk;
+            }
+            if (Mode == "unadvise") {
+                var UnadviseProbe = (delegate* unmanaged<IntPtr, uint, int>)KsVtbl[4];
+                Hr = UnadviseProbe(KeystrokeMgr, ClientId);
+                Log("Activate Unadvise(probe) hr=0x" + Hr.ToString("X8"));
+                State.KeystrokeMgr = KeystrokeMgr;
+                return SOk;
+            }
+            // 自測：用間接呼叫驗證 sink 的 vtable 真的可被呼叫。
+            try {
+                var SelfVtbl = *(IntPtr**)State.SinkView;
+                var SelfQuery = (delegate* unmanaged<IntPtr, Guid*, IntPtr*, int>)SelfVtbl[0];
+                var SelfIid = IidKeyEventSink;
+                IntPtr SelfOut = IntPtr.Zero;
+                var SelfHr = SelfQuery(State.SinkView, &SelfIid, &SelfOut);
+                Log("self-test sink QI hr=0x" + SelfHr.ToString("X8") + " out=" + SelfOut.ToString("X"));
+            }
+            catch (Exception Exception) {
+                Log("self-test EX " + Exception);
+            }
+            if (Mode == "nullsink") {
+                var NullAdvise = (delegate* unmanaged<IntPtr, uint, IntPtr, int, int>)KsVtbl[3];
+                Hr = NullAdvise(KeystrokeMgr, ClientId, IntPtr.Zero, 0);
+                Log("Activate null-sink Advise hr=0x" + Hr.ToString("X8"));
+                State.KeystrokeMgr = KeystrokeMgr;
+                return SOk;
+            }
+            {
+                var Vt = *(IntPtr**)State.SinkView;
+                var Slots = new StringBuilder();
+                for (var I = 0; I < 9; I++) { Slots.Append(Vt[I].ToString("X")).Append(' '); }
+                Log("sink vtbl=" + ((IntPtr)Vt).ToString("X") + " slots=" + Slots);
+            }
+            var Advise = (delegate* unmanaged<IntPtr, uint, IntPtr, int, int>)KsVtbl[3];
+            Log("Activate advising clientId=" + ClientId + " sink=" + State.SinkView.ToString("X"));
+            Hr = Advise(KeystrokeMgr, ClientId, State.SinkView, 1);
+            Log("Activate AdviseKeyEventSink hr=0x" + Hr.ToString("X8"));
+            if (Hr < 0) {
+                ReleaseCom(KeystrokeMgr);
+                return Hr;
+            }
+            State.KeystrokeMgr = KeystrokeMgr;
+            return SOk;
+        }
+        catch (Exception Exception) {
+            Log("Activate EX " + Exception);
+            return EFail;
+        }
+    }
+
+    private static int DeactivateCore(IntPtr ThisPtr) {
+        try {
+            var State = GetState(ThisPtr);
+            if (State is null) {
+                return EFail;
+            }
+            if (State.KeystrokeMgr != IntPtr.Zero) {
+                var KsVtbl = *(IntPtr***)State.KeystrokeMgr;
+                var Unadvise = (delegate* unmanaged<IntPtr, uint, int>)KsVtbl[4];
+                Unadvise(State.KeystrokeMgr, State.ClientId);
+                ReleaseCom(State.KeystrokeMgr);
+                State.KeystrokeMgr = IntPtr.Zero;
+            }
+            lock (State) {
+                State.Preedit.Clear();
+            }
+            Send("HIDE");
+            Log("Deactivate done");
+            return SOk;
+        }
+        catch (Exception Exception) {
+            Log("Deactivate EX " + Exception);
+            return EFail;
+        }
+    }
+
+    private static int OnSetFocusCore(IntPtr ThisPtr, int IsForeground) {
+        try {
+            Log("OnSetFocus fg=" + IsForeground);
+            var State = GetState(ThisPtr);
+            if (State is not null && IsForeground == 0) {
+                lock (State) {
+                    State.Preedit.Clear();
+                }
+                Send("HIDE");
+            }
+            return SOk;
+        }
+        catch (Exception Exception) {
+            Log("OnSetFocus EX " + Exception);
+            return EFail;
+        }
+    }
+
+    private static int OnTestKeyDownCore(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) {
+        try {
+            var VirtualKey = (int)WParam.ToInt64();
+            Log("OnTestKeyDown vk=" + VirtualKey);
+            *IsEaten = IsSupported(VirtualKey) ? 1 : 0;
+            return SOk;
+        }
+        catch (Exception Exception) {
+            Log("OnTestKeyDown EX " + Exception);
+            *IsEaten = 0;
+            return EFail;
+        }
+    }
+
+    private static int OnKeyDownCore(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) {
+        try {
+            var State = GetState(ThisPtr);
+            if (State is null) {
+                *IsEaten = 0;
+                return EFail;
+            }
+            var VirtualKey = (int)WParam.ToInt64();
+            if (!IsSupported(VirtualKey)) {
+                *IsEaten = 0;
+                return SOk;
+            }
+            *IsEaten = 1;
+            ApplyKey(State, VirtualKey);
+            return SOk;
+        }
+        catch (Exception Exception) {
+            Log("OnKeyDown EX " + Exception);
+            *IsEaten = 0;
+            return EFail;
+        }
+    }
+
+    private static int OnTestKeyUpCore(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) {
+        Log("OnTestKeyUp");
+        *IsEaten = 0;
+        return SOk;
+    }
+
+    private static int OnKeyUpCore(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) {
+        Log("OnKeyUp");
+        *IsEaten = 0;
+        return SOk;
+    }
+
+    private static int OnPreservedKeyCore(IntPtr ThisPtr, IntPtr Context, Guid* PreservedKey, int* IsEaten) {
+        Log("OnPreservedKey");
+        *IsEaten = 0;
+        return SOk;
+    }
+
+    private static bool IsSupported(int VirtualKey) {
+        return VirtualKey is >= 0x30 and <= 0x39 or >= 0x41 and <= 0x5A or VkSpace or VkBackspace or VkEscape;
+    }
+
+    private static void ApplyKey(TsfState State, int VirtualKey) {
+        lock (State) {
+            if (VirtualKey == VkEscape) {
+                State.Preedit.Clear();
+                Send("HIDE");
+                return;
+            }
+            if (VirtualKey == VkSpace) {
+                State.Preedit.Clear();
+                Send("HIDE");
+                return;
+            }
+            if (VirtualKey == VkBackspace) {
+                if (State.Preedit.Length > 0) {
+                    State.Preedit.Length--;
+                }
+                if (State.Preedit.Length == 0) {
+                    Send("HIDE");
+                }
+                else {
+                    SendShow(State.Preedit.ToString());
+                }
+                return;
+            }
+            State.Preedit.Append(char.ToLowerInvariant((char)VirtualKey));
+            SendShow(State.Preedit.ToString());
+        }
+    }
+
+    private static void SendShow(string Preedit) {
+        Send("SHOW|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(Preedit)));
+    }
+
+    private static void Send(string Message) {
+        try {
+            using var Client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
+            Client.Connect(10);
+            using var Writer = new StreamWriter(Client, new UTF8Encoding(false)) { AutoFlush = true };
+            Writer.WriteLine(Message);
+        }
+        catch (Exception Exception) {
+            Log("Pipe failed " + Exception.GetType().Name);
+        }
+    }
+
+    private static void ReleaseCom(IntPtr ComObject) {
+        var Vtbl = *(IntPtr***)ComObject;
+        var Release = (delegate* unmanaged<IntPtr, int>)Vtbl[2];
+        Release(ComObject);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CfgCallTargetInfo {
+        public IntPtr Offset;
+        public IntPtr Flags;
+    }
+
+    [DllImport("kernelbase.dll", SetLastError = true)]
+    private static extern bool SetProcessValidCallTargets(IntPtr Process, IntPtr VirtualAddress, UIntPtr RegionSize, uint NumberOfOffsets, [In] CfgCallTargetInfo[] OffsetInformation);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    /// <summary>
+    /// 把我們 vtable 裡的函式位址註冊成 CFG 合法間接呼叫目標。
+    /// TSF（msctf.dll）是 CFG 保護的，它間接呼叫我們的 sink 時若目標不在 bitmap 內，
+    /// 會直接 fail-fast，連我們的函式都不會進去；NativeAOT 產生的 DLL 沒有 guard CF function table，
+    /// 所以必須自己註冊。
+    /// </summary>
+    private static void CollectTargets(IntPtr* Table, int Count, List<IntPtr> Targets) {
+        for (var Index = 0; Index < Count; Index++) {
+            var Slot = Table[Index];
+            if (Slot != IntPtr.Zero && !Targets.Contains(Slot)) {
+                Targets.Add(Slot);
+            }
+        }
+    }
+
+    private static void RegisterCfgTargets() {
+        try {
+            var Targets = new List<IntPtr>();
+            CollectTargets(TipVtbl, 5, Targets);
+            CollectTargets(SinkVtbl, 9, Targets);
+            CollectTargets(FactoryVtbl, 5, Targets);
+            foreach (var Target in Targets) {
+                var Page = (IntPtr)(Target.ToInt64() & ~0xFFFL);
+                var Info = new[] { new CfgCallTargetInfo { Offset = (IntPtr)(Target.ToInt64() - Page.ToInt64()), Flags = (IntPtr)1 } };
+                var Ok = SetProcessValidCallTargets(GetCurrentProcess(), Page, (UIntPtr)0x1000, 1, Info);
+                Log("CFG register " + Target.ToString("X") + " ok=" + Ok);
+            }
+        }
+        catch (Exception Exception) {
+            Log("CFG register EX " + Exception);
+        }
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr AddVectoredExceptionHandler(uint First, IntPtr Handler);
+
+    [UnmanagedCallersOnly]
+    private static int VectoredExceptionHandler(IntPtr ExceptionInfo) {
+        try {
+            // EXCEPTION_RECORD: Code(+0) Flags(+4) Next(+8) Address(+16) NumberParameters(+24) Information(+32)
+            var Info = (IntPtr*)ExceptionInfo;
+            var Record = (IntPtr*)Info[0];
+            var Code = (uint)Record[0].ToInt64();
+            var Address = Record[2];
+            var ParamCount = (uint)(Record[3].ToInt64() & 0xFFFFFFFF);
+            var Info0 = Record[4];
+            var Info1 = Record[5];
+            Log("VEH code=0x" + Code.ToString("X8") + " addr=" + Address.ToString("X") + " n=" + ParamCount + " info0=" + Info0.ToString("X") + " info1=" + Info1.ToString("X"));
+        }
+        catch {
+        }
+        return 0;
+    }
+
+    private static void Log(string Message) {
+        try {
+            var DirectoryPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NganImePoc");
+            Directory.CreateDirectory(DirectoryPath);
+            var Line = DateTime.Now.ToString("HH:mm:ss.fff") + " [" + Environment.ProcessId + "] " + Message + Environment.NewLine;
+            lock (LogGate) {
+                File.AppendAllText(Path.Combine(DirectoryPath, "tsf-native.log"), Line, Encoding.UTF8);
+            }
+        }
+        catch {
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    private static int QueryInterfaceEntry(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) { Log("QI-entry this=" + ThisPtr.ToString("X")); return QueryCore(ThisPtr, Riid, Ppv); }
+
+    [UnmanagedCallersOnly]
+    private static int AddRefEntry(IntPtr ThisPtr) { Log("AddRef-entry this=" + ThisPtr.ToString("X")); return AddRefCore(ThisPtr); }
+
+    [UnmanagedCallersOnly]
+    private static int ReleaseEntry(IntPtr ThisPtr) { Log("Release-entry this=" + ThisPtr.ToString("X")); return ReleaseCore(ThisPtr); }
+
+    [UnmanagedCallersOnly]
+    private static int ActivateEntry(IntPtr ThisPtr, IntPtr ThreadManager, uint ClientId) => ActivateCore(ThisPtr, ThreadManager, ClientId);
+
+    [UnmanagedCallersOnly]
+    private static int DeactivateEntry(IntPtr ThisPtr) => DeactivateCore(ThisPtr);
+
+    [UnmanagedCallersOnly]
+    private static int OnSetFocusEntry(IntPtr ThisPtr, int IsForeground) { Log("OnSetFocus-entry this=" + ThisPtr.ToString("X")); return OnSetFocusCore(ThisPtr, IsForeground); }
+
+    [UnmanagedCallersOnly]
+    private static int OnTestKeyDownEntry(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) => OnTestKeyDownCore(ThisPtr, Context, WParam, LParam, IsEaten);
+
+    [UnmanagedCallersOnly]
+    private static int OnTestKeyUpEntry(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) => OnTestKeyUpCore(ThisPtr, Context, WParam, LParam, IsEaten);
+
+    [UnmanagedCallersOnly]
+    private static int OnKeyDownEntry(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) => OnKeyDownCore(ThisPtr, Context, WParam, LParam, IsEaten);
+
+    [UnmanagedCallersOnly]
+    private static int OnKeyUpEntry(IntPtr ThisPtr, IntPtr Context, IntPtr WParam, IntPtr LParam, int* IsEaten) => OnKeyUpCore(ThisPtr, Context, WParam, LParam, IsEaten);
+
+    [UnmanagedCallersOnly]
+    private static int OnPreservedKeyEntry(IntPtr ThisPtr, IntPtr Context, Guid* PreservedKey, int* IsEaten) => OnPreservedKeyCore(ThisPtr, Context, PreservedKey, IsEaten);
+
+    [UnmanagedCallersOnly]
+    private static int FactoryQueryInterfaceEntry(IntPtr ThisPtr, Guid* Riid, IntPtr* Ppv) => FactoryQueryCore(ThisPtr, Riid, Ppv);
+
+    [UnmanagedCallersOnly]
+    private static int FactoryAddRefEntry(IntPtr ThisPtr) => Interlocked.Increment(ref FactoryRefCount);
+
+    [UnmanagedCallersOnly]
+    private static int FactoryReleaseEntry(IntPtr ThisPtr) => Interlocked.Decrement(ref FactoryRefCount);
+
+    [UnmanagedCallersOnly]
+    private static int CreateInstanceEntry(IntPtr ThisPtr, IntPtr Outer, Guid* Riid, IntPtr* Ppv) => CreateInstanceCore(ThisPtr, Outer, Riid, Ppv);
+
+    [UnmanagedCallersOnly]
+    private static int LockServerEntry(IntPtr ThisPtr, int Lock) => SOk;
+}

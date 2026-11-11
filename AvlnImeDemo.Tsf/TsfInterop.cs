@@ -188,8 +188,8 @@ public interface ITfRange {
 [Guid("20168D64-5A8F-4A5A-B7BD-CFA29F4D0FD9")]
 [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 public interface ITfComposition {
-    /// <summary>Gets the live editable composition range.</summary>
-    int GetRange(out ITfRange Range);
+    /// <summary>Gets the live editable composition range. The edit cookie is part of the SDK signature.</summary>
+    int GetRange(uint EditCookie, out ITfRange Range);
     /// <summary>Moves composition start.</summary>
     int ShiftStart(uint EditCookie, ITfRange Range);
     /// <summary>Moves composition end.</summary>
