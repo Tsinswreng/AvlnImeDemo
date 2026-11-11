@@ -479,6 +479,7 @@ internal static unsafe class NativeTsf {
             }
             *IsEaten = 1;
             ApplyKey(State, VirtualKey);
+            UpdateCaretFromGui(State);
             if (State.PendingOperation != 0) {
                 // 字母鍵只取游標位置；空白鍵才真的寫入文件。
                 var Hr = RequestEditSession(State, Context);
@@ -528,7 +529,56 @@ internal static unsafe class NativeTsf {
                 return;
             }
             State.Preedit.Append(char.ToLowerInvariant((char)VirtualKey));
-            State.PendingOperation = 1;
+            State.PendingOperation = 0;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GuiThreadInfo {
+        public uint Size;
+        public uint Flags;
+        public IntPtr Active;
+        public IntPtr Focus;
+        public IntPtr Capture;
+        public IntPtr MenuOwner;
+        public IntPtr MoveSize;
+        public IntPtr Caret;
+        public NativeRect CaretRect;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetGUIThreadInfo(uint ThreadId, ref GuiThreadInfo Info);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ClientToScreen(IntPtr Window, ref NativePoint Point);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    /// <summary>
+    /// 用 Win32 的 GUI thread info 取得插入點位置。
+    /// TSF 的 ITfContextView::GetTextExt 在這版 Windows 的 ABI 與文件不一致（會把 edit cookie
+    /// 當成指標），先用 caret 矩形代替；記事本這類原生控件都拿得到。
+    /// </summary>
+    private static void UpdateCaretFromGui(TsfState State) {
+        try {
+            var Info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf<GuiThreadInfo>() };
+            if (GetGUIThreadInfo(GetCurrentThreadId(), ref Info) && Info.Caret != IntPtr.Zero) {
+                var Point = new NativePoint { X = Info.CaretRect.Left, Y = Info.CaretRect.Bottom };
+                if (ClientToScreen(Info.Caret, ref Point)) {
+                    State.CaretX = Point.X;
+                    State.CaretY = Point.Y;
+                }
+            }
+        }
+        catch (Exception Exception) {
+            Log("UpdateCaretFromGui EX " + Exception);
         }
     }
 
@@ -590,7 +640,6 @@ internal static unsafe class NativeTsf {
                 State.PendingOperation = 0;
                 Log("DoEditSession op=" + Operation + " ec=0x" + EditCookie.ToString("X") + " text=[" + State.Preedit + "]");
                 return Operation switch {
-                    1 => UpdateCaretCore(State, EditCookie),
                     2 => InsertTextCore(State, EditCookie),
                     _ => SOk,
                 };
@@ -600,46 +649,6 @@ internal static unsafe class NativeTsf {
             Log("DoEditSession EX " + Exception);
             return EFail;
         }
-    }
-
-    /// <summary>
-    /// 取得目前選取範圍（游標）在螢幕上的矩形，換算候選窗要出現的位置。
-    /// 需要 edit session 才能呼叫 ITfContext::GetActiveView 與 ITfContextView::GetTextExt。
-    /// </summary>
-    private static int UpdateCaretCore(TsfState State, uint EditCookie) {
-        var ContextVtbl = *(IntPtr**)State.Context;
-        var GetSelection = (delegate* unmanaged<IntPtr, uint, uint, uint, TfSelection*, uint*, int>)ContextVtbl[5];
-        var Selection = default(TfSelection);
-        uint Fetched = 0;
-        var Hr = GetSelection(State.Context, EditCookie, 0, 1, &Selection, &Fetched);
-        if (Hr < 0 || Fetched != 1 || Selection.Range == IntPtr.Zero) {
-            Log("UpdateCaret GetSelection hr=0x" + Hr.ToString("X8"));
-            return SOk;
-        }
-        var GetActiveView = (delegate* unmanaged<IntPtr, uint, IntPtr*, int>)ContextVtbl[9];
-        IntPtr View = IntPtr.Zero;
-        Hr = GetActiveView(State.Context, EditCookie, &View);
-        if (Hr >= 0 && View != IntPtr.Zero) {
-            var ViewVtbl = *(IntPtr**)View;
-            var GetTextExt = (delegate* unmanaged<IntPtr, uint, IntPtr, NativeRect*, int*, int>)ViewVtbl[4];
-            var Rect = default(NativeRect);
-            var Clipped = 0;
-            Hr = GetTextExt(View, EditCookie, Selection.Range, &Rect, &Clipped);
-            if (Hr >= 0) {
-                State.CaretX = Rect.Left;
-                State.CaretY = Rect.Bottom;
-                Log("UpdateCaret x=" + Rect.Left + " y=" + Rect.Bottom + " clipped=" + Clipped);
-            }
-            else {
-                Log("GetTextExt hr=0x" + Hr.ToString("X8"));
-            }
-            ReleaseCom(View);
-        }
-        else {
-            Log("GetActiveView hr=0x" + Hr.ToString("X8"));
-        }
-        ReleaseCom(Selection.Range);
-        return SOk;
     }
 
     /// <summary>
